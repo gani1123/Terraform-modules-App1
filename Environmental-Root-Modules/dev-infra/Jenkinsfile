@@ -1,0 +1,140 @@
+pipeline {
+    agent any
+
+    parameters {
+        choice(name: 'ENV', choices: ['main', 'dev', 'qa', 'prod'], description: 'Select Environment')
+        choice(name: 'ACTION', choices: ['apply', 'destroy'], description: 'Terraform Action')
+    }
+
+    environment {
+        PROJECT_NAME = ""
+    }
+
+    stages {
+
+        stage('Checkout Code') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Validate Repo & Pipeline Name') {
+            steps {
+                script {
+                    def repoUrl = env.GIT_URL
+
+                    if (!repoUrl) {
+                        repoUrl = sh(
+                            script: "git config --get remote.origin.url",
+                            returnStdout: true
+                        ).trim()
+                    }
+
+                    def repoName = repoUrl.tokenize('/').last().replace('.git','').toLowerCase()
+                    def fullJobName = env.JOB_NAME
+                    def pipelineName = fullJobName.tokenize('/')[0].toLowerCase()
+
+                    if (repoName != pipelineName) {
+                        error "❌ Pipeline name must match repo name"
+                    }
+
+                    env.PROJECT_NAME = pipelineName
+                }
+            }
+        }
+
+        stage('Validate Inputs') {
+            steps {
+                script {
+                    if (!(params.ENV in ['main','dev','qa','prod'])) {
+                        error "❌ Invalid ENV"
+                    }
+
+                    if (!fileExists("${params.ENV}.tfvars")) {
+                        error "❌ Missing tfvars file"
+                    }
+                }
+            }
+        }
+
+        stage('Terraform Init') {
+            steps {
+                configFileProvider([configFile(fileId: 'app-Backend-file', variable: 'BACKEND_FILE')]) {
+                    sshagent(['gitlab-ssh-key']) {
+                        script {
+                            def jobName = env.JOB_NAME.tokenize('/')[0]
+                            env.PROJECT_NAME = jobName.toLowerCase()
+
+                            sh """
+                            terraform init \
+                            -backend-config=$BACKEND_FILE \
+                            -backend-config="key=${env.PROJECT_NAME}/${env.BRANCH_NAME}/terraform.tfstate" \
+                            -reconfigure \
+                            -input=false
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Terraform Plan') {
+            when {
+                expression { params.ACTION == 'apply' }
+            }
+            steps {
+                sshagent(['gitlab-ssh-key']) {
+                    sh """
+                    terraform plan \
+                    -var-file=${params.ENV}.tfvars \
+                    -out=tfplan
+                    """
+                }
+            }
+        }
+
+        // 🔥 NEW APPROVAL STAGE
+        stage('Approval') {
+            when {
+                anyOf {
+                    expression { params.ACTION == 'apply' }
+                    expression { params.ACTION == 'destroy' }
+                }
+            }
+            steps {
+                script {
+                    timeout(time: 10, unit: 'MINUTES') {
+                        input message: "Approve ${params.ACTION} for ${params.ENV}?",
+                              ok: "Yes, Proceed"
+                    }
+                }
+            }
+        }
+
+        stage('Terraform Apply') {
+            when {
+                expression { params.ACTION == 'apply' }
+            }
+            steps {
+                sshagent(['gitlab-ssh-key']) {
+                    sh "terraform apply -auto-approve tfplan"
+                }
+            }
+        }
+
+        stage('Terraform Destroy') {
+            when {
+                expression { params.ACTION == 'destroy' }
+            }
+            steps {
+                sshagent(['gitlab-ssh-key']) {
+                    sh """
+                    terraform destroy \
+                    -auto-approve \
+                    -var-file=${params.ENV}.tfvars
+                    """
+                }
+            }
+        }
+    }
+}
